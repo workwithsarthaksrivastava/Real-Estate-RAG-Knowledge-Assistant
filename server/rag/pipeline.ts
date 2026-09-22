@@ -1,4 +1,3 @@
-import { GoogleGenAI } from "@google/genai";
 import {
   DocumentMetadata,
   DocumentChunk,
@@ -12,7 +11,7 @@ import {
   ChatHistoryEntry,
   ChatRequestOptions,
 } from './types.js';
-import { EmbeddingProvider, GeminiEmbeddingProvider, LocalSemanticEmbeddingProvider } from './embeddings.js';
+import { EmbeddingProvider, LocalSemanticEmbeddingProvider } from './embeddings.js';
 import { VectorStore } from './vectorstore.js';
 import { BM25Engine } from './bm25.js';
 import { HybridSearchEngine } from './hybrid.js';
@@ -20,7 +19,7 @@ import { StructureAwareChunker } from './chunker.js';
 import { DocumentExtractor } from './extractor.js';
 import { ConflictDetector } from './conflicts.js';
 import { SEED_DOCUMENTS } from './seedDocuments.js';
-
+import { LLMProvider, GroqLLMProvider } from './llm.js';
 
 export class RAGPipeline {
   private vectorStore: VectorStore;
@@ -29,17 +28,11 @@ export class RAGPipeline {
   private chunker: StructureAwareChunker;
   private documents: Map<string, DocumentMetadata> = new Map();
   private rawDocumentTexts: Map<string, string> = new Map();
-  private ai: GoogleGenAI | null = null;
+  private llmProvider: LLMProvider;
   private lastPropertyContext: string | null = null;
 
   constructor() {
-    // Choose Gemini embeddings if API key is present, otherwise high-performance local semantic embeddings
-    const apiKey = process.env.GEMINI_API_KEY;
-    const hasKey = apiKey && apiKey !== "MY_GEMINI_API_KEY" && apiKey.length > 5;
-    const provider: EmbeddingProvider = hasKey
-      ? new GeminiEmbeddingProvider()
-      : new LocalSemanticEmbeddingProvider();
-
+    const provider: EmbeddingProvider = new LocalSemanticEmbeddingProvider();
     this.vectorStore = new VectorStore(provider);
     this.bm25Engine = new BM25Engine();
     this.hybridSearch = new HybridSearchEngine(this.vectorStore, this.bm25Engine);
@@ -47,21 +40,7 @@ export class RAGPipeline {
       chunkSizeTokens: 500,
       chunkOverlapTokens: 60,
     });
-
-    if (hasKey) {
-      try {
-        this.ai = new GoogleGenAI({
-          apiKey,
-          httpOptions: {
-            headers: {
-              'User-Agent': 'aistudio-build',
-            },
-          },
-        });
-      } catch (e) {
-        console.warn("Could not instantiate Gemini client:", e);
-      }
-    }
+    this.llmProvider = new GroqLLMProvider();
   }
 
   public async initialize(): Promise<void> {
@@ -209,7 +188,7 @@ export class RAGPipeline {
       totalProperties: properties.size,
       properties: Array.from(properties),
       embeddingProvider: this.vectorStore.getEmbeddingProvider().name,
-      aiEngineActive: !!(this.ai && process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY"),
+      aiEngineActive: this.llmProvider.isAvailable(),
     };
   }
 
@@ -288,15 +267,6 @@ export class RAGPipeline {
           chunk_id: chunk.chunk_id,
         }));
 
-    // Determine target model based on user selection
-    const mode = options?.mode || 'balanced';
-    let targetModel = 'gemini-3.5-flash';
-    if (mode === 'fast') {
-      targetModel = 'gemini-3.1-flash-lite';
-    } else if (mode === 'complex') {
-      targetModel = 'gemini-3.1-pro-preview';
-    }
-
     // 6. Grounded Generation
     const genStartTime = Date.now();
     let answer = '';
@@ -310,8 +280,7 @@ export class RAGPipeline {
         detectedConflicts,
         confidence,
         history,
-        options,
-        targetModel
+        options
       );
     }
 
@@ -333,8 +302,8 @@ export class RAGPipeline {
         chunks_evaluated: 12,
         chunks_provided_to_llm: retrievedChunks.length,
         tokens_used_estimate: Math.ceil((userQuery.length + retrievedChunks.reduce((acc, c) => acc + c.content.length, 0)) / 4),
-        model: this.ai && process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY"
-          ? targetModel
+        model: this.llmProvider.isAvailable()
+          ? this.llmProvider.getModelName(options?.mode)
           : 'Grounding-Engine',
       },
       retrieved_chunks: retrievedChunks,
@@ -429,8 +398,7 @@ ${groundingBase}`;
     conflicts: any[],
     confidence: ConfidenceLevel,
     history: ChatHistoryEntry[],
-    options?: ChatRequestOptions,
-    modelName: string = 'gemini-3.5-flash'
+    options?: ChatRequestOptions
   ): Promise<string> {
     const systemPrompt = this.buildSystemInstruction(options?.role, options?.customSystemInstruction);
 
@@ -444,60 +412,21 @@ ${groundingBase}`;
         conflicts.map((c) => `- ${c.summary}`).join('\n');
     }
 
-    // Prepare multi-turn contents
-    const contents: any[] = [];
-    const recentHistory = history.slice(-6);
-    for (const entry of recentHistory) {
-      contents.push({
-        role: entry.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: entry.content }],
-      });
-    }
-
-    contents.push({
-      role: 'user',
-      parts: [
-        {
-          text: `VERIFIED PROPERTY DOCUMENTS CONTEXT:\n${contextText}${conflictNote}\n\nUSER QUESTION: ${query}\n\nPlease provide a strictly grounded, accurate response following your role:`,
-        },
-      ],
-    });
-
-    // Attempt Gemini call if API key configured
-    if (this.ai && process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY") {
+    if (this.llmProvider.isAvailable()) {
       try {
-        const response = await this.ai.models.generateContent({
-          model: modelName,
-          contents,
-          config: {
-            systemInstruction: systemPrompt,
-            temperature: 0.1,
-          },
-        });
-
-        const text = response.text;
-        if (text && text.trim().length > 0) {
-          return text.trim();
+        const groqAnswer = await this.llmProvider.generateGroundedAnswer(
+          systemPrompt,
+          query,
+          contextText,
+          conflictNote,
+          history,
+          options
+        );
+        if (groqAnswer && groqAnswer.trim().length > 0) {
+          return groqAnswer.trim();
         }
       } catch (err) {
-        console.warn(`Gemini generation with ${modelName} failed, falling back:`, err);
-        // If complex model failed, try fast/flash fallback
-        if (modelName === 'gemini-3.1-pro-preview') {
-          try {
-            const fallbackRes = await this.ai.models.generateContent({
-              model: 'gemini-3.8-flash',
-              contents,
-              config: {
-                systemInstruction: systemPrompt,
-                temperature: 0.1,
-              },
-            });
-            const text = fallbackRes.text;
-            if (text && text.trim().length > 0) return text.trim();
-          } catch (e2) {
-            console.warn("Fallback model also failed:", e2);
-          }
-        }
+        console.warn("[RAG Pipeline] Provider generation failed, falling back to deterministic synthesizer:", err);
       }
     }
 

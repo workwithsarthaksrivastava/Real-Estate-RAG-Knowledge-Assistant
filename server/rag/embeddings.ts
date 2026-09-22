@@ -1,5 +1,3 @@
-import { GoogleGenAI } from "@google/genai";
-
 export interface EmbeddingProvider {
   name: string;
   dimension: number;
@@ -7,7 +5,7 @@ export interface EmbeddingProvider {
   embedBatch(texts: string[]): Promise<number[][]>;
 }
 
-// Fallback high-entropy semantic feature projector for zero-latency local embedding
+// High-entropy semantic feature projector for zero-latency local embedding
 export class LocalSemanticEmbeddingProvider implements EmbeddingProvider {
   public name = "Local-Semantic-Dense";
   public dimension = 384;
@@ -87,62 +85,6 @@ export class LocalSemanticEmbeddingProvider implements EmbeddingProvider {
 
   public async embedBatch(texts: string[]): Promise<number[][]> {
     return Promise.all(texts.map((t) => this.embedText(t)));
-  }
-}
-
-export class GeminiEmbeddingProvider implements EmbeddingProvider {
-  public name = "Gemini-Embedding-2";
-  public dimension = 768;
-  private ai: GoogleGenAI | null = null;
-  private fallback: LocalSemanticEmbeddingProvider;
-
-  constructor() {
-    this.fallback = new LocalSemanticEmbeddingProvider();
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (apiKey && apiKey !== "MY_GEMINI_API_KEY") {
-      try {
-        this.ai = new GoogleGenAI({
-          apiKey,
-          httpOptions: {
-            headers: {
-              'User-Agent': 'aistudio-build',
-            },
-          },
-        });
-      } catch (e) {
-        console.warn("Gemini client initialization warning:", e);
-      }
-    }
-  }
-
-  public async embedText(text: string): Promise<number[]> {
-    if (!this.ai || !process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "MY_GEMINI_API_KEY") {
-      return this.fallback.embedText(text);
-    }
-
-    try {
-      // Use gemini-embedding-2-preview or fallback gracefully
-      const response = await (this.ai.models as any).embedContent({
-        model: 'gemini-embedding-2-preview',
-        contents: text,
-      });
-
-      if (response?.embedding?.values) {
-        return response.embedding.values;
-      }
-    } catch (err) {
-      console.warn("Gemini embedding call failed, using fallback:", err);
-    }
-
-    return this.fallback.embedText(text);
-  }
-
-  public async embedBatch(texts: string[]): Promise<number[][]> {
-    const results: number[][] = [];
-    for (const text of texts) {
-      results.push(await this.embedText(text));
-    }
-    return results;
   }
 }
 
