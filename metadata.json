@@ -1,0 +1,6 @@
+{
+  "name": "Real Estate RAG Knowledge Assistant",
+  "description": "Grounded Real Estate Retrieval-Augmented Generation (RAG) assistant that answers strictly from verified property brochures, floor plans, pricing sheets, and project schedules with traceable citations, conflict detection, and hallucination safeguards.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
